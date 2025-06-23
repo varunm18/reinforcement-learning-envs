@@ -12,7 +12,7 @@ from matplotlib import animation
 
 from collections import defaultdict
 
-# Q-Learning
+# Q-Learning with Temporal Difference (TD)
 class QLearn():
     def __init__(self, env, alpha, gamma, epsilon, epsilon_decay, min_epsilon):
         self.env = env
@@ -187,7 +187,8 @@ class Reinforce():
                 returns.insert(0, R)
 
             returns = torch.tensor(returns)
-            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+            if returns.size(dim=-1) > 1:
+                returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
             loss = 0
             self.optimizer.zero_grad()
