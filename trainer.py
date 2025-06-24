@@ -15,7 +15,7 @@ from collections import defaultdict, deque
 # DDQN (Double DQN)
 class DDQN:
     def __init__(self, env, q_net_class, buffer_size, batch_size,
-                 gamma, lr, tau, epsilon_start, epsilon_end, 
+                 gamma, lr, epsilon_start, epsilon_end, 
                  epsilon_decay, target_update_interval):
 
         self.env = env
@@ -30,7 +30,6 @@ class DDQN:
         self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
         self.gamma = gamma
-        self.tau = tau
 
         self.epsilon = epsilon_start
         self.epsilon_end = epsilon_end
@@ -44,7 +43,7 @@ class DDQN:
     def select_action(self, state):
         if random.random() < self.epsilon:
             return self.env.action_space.sample()
-        state = torch.tensor(state).float().view(1, -1)
+        state = torch.from_numpy(np.array(state)).unsqueeze(0).float()
         with torch.no_grad():
             q_values = self.q_net(state)
         return torch.argmax(q_values).item()
@@ -53,11 +52,12 @@ class DDQN:
         batch = random.sample(self.buffer, self.batch_size)
         # convert (s, a, r, s, d) list into tuples of all s, a, r, s, d
         state, action, reward, next_state, done = zip(*batch)
-        return (torch.tensor(state).float(),               # batch x state size
-                torch.tensor(action).view(-1, 1),          # batch x 1
-                torch.tensor(reward).float().view(-1, 1),  # batch x 1
-                torch.tensor(next_state).float(),          # batch x state size
-                torch.tensor(done).float().view(-1, 1))    # batch x 1
+
+        return (torch.from_numpy(np.array(state)).float(),      # batch x state size
+                torch.tensor(action).view(-1, 1),               # batch x 1
+                torch.tensor(reward).view(-1, 1).float(),       # batch x 1
+                torch.from_numpy(np.array(next_state)).float(), # batch x state size
+                torch.tensor(done).view(-1, 1).float())         # batch x 1
 
     def train_step(self):
         if len(self.buffer) < self.batch_size:
@@ -126,7 +126,7 @@ class DDQN:
             frames.append(self.env.render())
 
             with torch.no_grad():
-                q_vals = self.q_net(torch.tensor(observation).float().view(1, -1))
+                q_vals = self.q_net(torch.from_numpy(np.array(observation)).unsqueeze(0).float())
                 action = torch.argmax(q_vals, dim=1).item()
 
             observation, reward, terminated, truncated, _ = self.env.step(action)
@@ -163,7 +163,7 @@ class DDQN:
             while not episode_over:
 
                 with torch.no_grad():
-                    q_vals = self.q_net(torch.tensor(observation).float().view(1, -1))
+                    q_vals = self.q_net(torch.from_numpy(np.array(observation)).unsqueeze(0).float())
                     action = torch.argmax(q_vals, dim=1).item()
 
                 observation, reward, terminated, truncated, _ = self.env.step(action)
