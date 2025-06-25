@@ -125,16 +125,121 @@ class Agent(ABC):
         """
         pass
 
-# class A2C(Agent):
-#     def __init__(self, env, actor_critic, gamma):
-#         super().__init__(env)
+# Advantage Actor Critic (A2C)
+class A2C(Agent):
+    def __init__(self, env, actor_critic, optimizer, gamma):
+        super().__init__(env)
 
-#         self.actor_critic = actor_critic
-#         self.gamma = gamma
+        self.actor_critic = actor_critic
+        self.optimizer = optimizer
+        self.gamma = gamma
+        self.critic_loss_fn = nn.MSELoss()
     
-#     def select_action(self, observation):
-        
-        
+    def select_action(self, observation):
+        obs_tensor = torch.from_numpy(np.array(observation)).unsqueeze(0).float()
+        probs, _ = self.actor_critic(obs_tensor)
+        return torch.argmax(probs, dim=1).item()
+    
+    def sample_action(self, observation):
+        obs_tensor = torch.from_numpy(np.array(observation)).unsqueeze(0).float()
+        probs, value = self.actor_critic(obs_tensor)
+        return probs, torch.multinomial(probs, num_samples=1).item(), value.squeeze()
+    
+    def train(self, episodes, stats_interval):
+        losses = []
+        rewards = []
+        max_reward = 0
+
+        for e in range(episodes):
+            observation, _ = self.env.reset()
+
+            log_probs = []
+            values = []
+            episode_rewards = []
+            total_episode_reward = 0
+
+            episode_over = False
+            while not episode_over:
+
+                probs, action, value = self.sample_action(observation)
+                observation, reward, terminated, truncated, _ = self.env.step(action)
+
+                log_probs.append(torch.log(probs[0, action]))
+                values.append(value)
+
+                episode_rewards.append(reward)
+                total_episode_reward += reward
+
+                episode_over = terminated or truncated
+            
+            rewards.append(total_episode_reward)
+            if total_episode_reward > max_reward:
+                max_reward = total_episode_reward
+                print(f"New max of {max_reward} in episode {e + 1}")
+
+            returns = []
+            R = 0
+            for r in reversed(episode_rewards):
+                R = r + self.gamma * R
+                returns.insert(0, R)
+
+            returns = torch.tensor(returns).float()
+            if returns.size(dim=-1) > 1:
+                returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+            
+            values = torch.stack(values)
+            log_probs = torch.stack(log_probs)
+            
+            advantages = returns - values
+
+            actor_loss = -(log_probs * advantages.detach()).sum()
+            critic_loss = self.critic_loss_fn(values, returns)
+
+            loss = actor_loss + critic_loss
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            losses.append(loss.item())
+
+            if (e + 1) % stats_interval == 0:
+                print(f"Episodes {(e - stats_interval + 1, e)}:", end=" ")
+                print(f"Avg Loss- {sum(losses[e-stats_interval+1:e+1])/stats_interval}", end=" ")
+                print(f"Avg Reward- {sum(rewards[e-stats_interval+1:e+1])/stats_interval}")
+                
+        self.env.close()
+
+        self.episodes_trained += episodes
+
+        return rewards, losses
+    
+    def save(self, path):
+        checkpoint = {
+            'env': self.env,
+            'actor_critic_state_dict': self.actor_critic.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'gamma': self.gamma,
+            'episodes_trained': self.episodes_trained
+        }
+        torch.save(checkpoint, path)
+        print(f"Model saved to {path}")
+    
+    def load(path):
+        checkpoint = torch.load(path)
+        a2c = A2C(
+            env=checkpoint['env'],
+            actor_critic=checkpoint['actor_critic_state_dict'].__class__(),
+            optimizer=torch.optim.Adam(checkpoint['actor_critic_state_dict'].__class__().parameters()),
+            gamma=checkpoint['gamma']
+        )
+        a2c.actor_critic.load_state_dict(checkpoint['actor_critic_state_dict'])
+        a2c.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        a2c.episodes_trained = checkpoint['episodes_trained']
+
+        print(f"Model loaded from {path}")
+        return a2c
+
     
 # DDQN (Double DQN) with Temporal Difference (TD)
 class DDQN(Agent):
