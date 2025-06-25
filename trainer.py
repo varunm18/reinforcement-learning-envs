@@ -12,20 +12,133 @@ from matplotlib import animation
 
 from collections import defaultdict, deque
 
-# DDQN (Double DQN)
-class DDQN:
+from abc import ABC, abstractmethod
+
+def moving_average(data, window_size):
+    weights = np.ones(window_size) / window_size
+    return np.convolve(data, weights, mode='valid')
+
+class Agent(ABC):
+    def __init__(self, env):
+        self.env = env
+        self.episodes_trained = 0
+
+    @abstractmethod
+    def select_action(self, observation):
+        """
+        Select an action based on the current observation.
+        """
+        pass
+
+    def play_episode(self, track_frames=False, grad=False):
+        """
+        Play a single episode in the environment.
+        """
+        observation, _ = self.env.reset()
+
+        episode_reward = []
+        if track_frames:
+            frames = []
+
+        episode_over = False
+        while not episode_over:
+            if track_frames:
+                frames.append(self.env.render())
+
+            with torch.set_grad_enabled(grad):
+                action = self.select_action(observation)
+
+            observation, reward, terminated, truncated, _ = self.env.step(action)
+            episode_reward.append(reward)
+
+            episode_over = terminated or truncated
+
+        return episode_reward, terminated, truncated, (frames if track_frames else None)
+    
+    @abstractmethod
+    def train(self, episodes, stats_interval):
+        """
+        Train the agent for a number of episodes.
+        """
+        pass
+    
+    def playback(self, fps=30, text_color="black", show_last_reward=False):
+        """
+        Play back the agent's performance in the environment.
+        """
+        episode_reward, terminated, truncated, frames = self.play_episode(track_frames=True)
+        print(f"Playback Return: {episode_reward[-1] if show_last_reward and terminated else sum(episode_reward)}")
+
+        self.env.close()
+
+        fig, ax = plt.subplots()
+        ax.axis("off")
+        im = ax.imshow(frames[0])
+
+        reward_text = ax.text(10, 20, "", color=text_color, fontsize=12, weight='bold')
+
+        def animate(i):
+            im.set_array(frames[i])
+
+            if show_last_reward and terminated and i == len(frames) - 1:
+                r = episode_reward[-1]
+            else:
+                r = sum(episode_reward[:i+1])
+
+            reward_text.set_text(f"Return: {r:.2f}")
+            return [im, reward_text]
+        
+        anim = animation.FuncAnimation(fig, animate, frames=len(frames), interval=1000/fps)
+        plt.close()
+        return anim.to_jshtml() 
+    
+    def eval(self, episodes, save_last_reward=False):
+        """ 
+        Evaluate the agent over a number of episodes.
+        If save_last is True, only the last reward of 
+        each episode is saved if terminated.
+        """
+        rewards = []
+        for _ in range(episodes):
+            episode_reward, terminated, truncated, _ = self.play_episode()
+
+            if save_last_reward and terminated:
+                rewards.append(episode_reward[-1])
+            else:
+                rewards.append(sum(episode_reward))
+
+        print(f"Average Return over {episodes} episodes: {np.mean(rewards)}")
+
+        self.env.close()
+
+    @abstractmethod
+    def save(self, path):
+        """
+        Save the agent's model to a file.
+        """
+        pass
+
+    @abstractmethod
+    def load(path):
+        """
+        Load agent from a file.
+        """
+        pass
+    
+# DDQN (Double DQN) with Temporal Difference (TD)
+class DDQN(Agent):
     def __init__(self, env, q_net_class, buffer_size, batch_size,
                  gamma, lr, epsilon_start, epsilon_end, 
                  epsilon_decay, target_update_interval):
 
-        self.env = env
+        super().__init__(env)
 
         self.q_net = q_net_class()
         self.target_net = q_net_class()
         self.target_net.load_state_dict(self.q_net.state_dict())
 
         self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=lr)
-        self.criterion = nn.MSELoss()
+        self.loss_fn = nn.MSELoss()
 
         self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
@@ -39,8 +152,12 @@ class DDQN:
         self.learn_step = 0
 
         self.losses = []
+    
+    def select_action(self, observation):
+        q_vals = self.q_net(torch.from_numpy(np.array(observation)).unsqueeze(0).float())
+        return torch.argmax(q_vals, dim=1).item()
 
-    def select_action(self, state):
+    def epsilon_greedy_policy(self, state):
         if random.random() < self.epsilon:
             return self.env.action_space.sample()
         state = torch.from_numpy(np.array(state)).unsqueeze(0).float()
@@ -73,8 +190,8 @@ class DDQN:
 
         target_q = rewards + (1 - dones) * self.gamma * next_q_values
         
-        # detach target_q from loss computation 
-        loss = self.criterion(q_values, target_q.detach())
+        # detach target_q from loss computation
+        loss = self.loss_fn(q_values, target_q.detach())
         self.losses.append(loss.item())
 
         self.optimizer.zero_grad()
@@ -87,6 +204,7 @@ class DDQN:
 
     def train(self, episodes, stats_interval):
         rewards = []
+        max_reward = 0
 
         for e in range(episodes):
             state, _ = self.env.reset()
@@ -94,7 +212,7 @@ class DDQN:
 
             episode_over = False
             while not episode_over:
-                action = self.select_action(state)
+                action = self.epsilon_greedy_policy(state)
                 next_state, reward, terminated, truncated, _ = self.env.step(action)
                 episode_over = terminated or truncated
 
@@ -103,84 +221,72 @@ class DDQN:
 
                 state = next_state
                 episode_reward += reward
-                if episode_over:
-                    break
 
             self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_end)
             rewards.append(episode_reward)
+
+            if episode_reward > max_reward:
+                max_reward = episode_reward
+                print(f"New max of {max_reward} in episode {e + 1}")
 
             if (e + 1) % stats_interval == 0:
                 print(f"Episodes {(e - stats_interval + 1, e)}:", end=" ")
                 print(f"Avg Reward- {np.mean(rewards[-stats_interval:])}", end=" ")
                 print(f"Epsilon- {self.epsilon}")
+            
+            self.episodes_trained += 1
 
         return rewards, self.losses
 
-    def playback(self, fps=30, text_color="black"):
-        episode_reward = []
-        frames = []
+    def save(self, path):
+        checkpoint = {
+            'env': self.env,
+            'q_net_class': self.q_net.__class__,
+            'buffer_size': self.buffer.maxlen,
+            'q_net_state_dict': self.q_net.state_dict(),
+            'target_net_state_dict': self.target_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'buffer': list(self.buffer),  # convert deque to list for saving
+            'batch_size': self.batch_size,
+            'gamma': self.gamma,
+            'epsilon': self.epsilon,
+            'epsilon_end': self.epsilon_end,
+            'epsilon_decay': self.epsilon_decay,
+            'target_update_interval': self.target_update_interval,
+            'learn_step': self.learn_step,
+            'episodes_trained': self.episodes_trained
+        }
+        torch.save(checkpoint, path)
+        print(f"Model saved to {path}")
 
-        observation, _ = self.env.reset()
-        episode_over = False
-        while not episode_over:
-            frames.append(self.env.render())
+    def load(path):
+        checkpoint = torch.load(path)
+        ddqn = DDQN(
+            env=checkpoint['env'],
+            q_net_class=checkpoint['q_net_class'],
+            buffer_size=checkpoint['buffer_size'],
+            batch_size=checkpoint['batch_size'],
+            gamma=checkpoint['gamma'],
+            lr=checkpoint['optimizer_state_dict']['param_groups'][0]['lr'],
+            epsilon_start=checkpoint['epsilon'],
+            epsilon_end=checkpoint['epsilon_end'],
+            epsilon_decay=checkpoint['epsilon_decay'],
+            target_update_interval=checkpoint['target_update_interval']
+        )
+        ddqn.q_net.load_state_dict(checkpoint['q_net_state_dict'])
+        ddqn.target_net.load_state_dict(checkpoint['target_net_state_dict'])
+        ddqn.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        ddqn.buffer = deque(checkpoint['buffer'], maxlen=checkpoint['buffer_size'])
+        ddqn.learn_step = checkpoint['learn_step']
+        ddqn.episodes_trained = checkpoint['episodes_trained']
 
-            with torch.no_grad():
-                q_vals = self.q_net(torch.from_numpy(np.array(observation)).unsqueeze(0).float())
-                action = torch.argmax(q_vals, dim=1).item()
-
-            observation, reward, terminated, truncated, _ = self.env.step(action)
-            episode_reward.append(reward)
-
-            episode_over = terminated or truncated
-
-        print(f"Playback Return: {sum(episode_reward)}")
-
-        self.env.close()
-
-        fig, ax = plt.subplots()
-        ax.axis("off")
-        im = ax.imshow(frames[0])
-
-        reward_text = ax.text(10, 20, "", color=text_color, fontsize=12, weight='bold')
-
-        def animate(i):
-            im.set_array(frames[i])
-            r = sum(episode_reward[:i+1])
-            reward_text.set_text(f"Return: {r:.2f}")
-            return [im, reward_text]
-        
-        anim = animation.FuncAnimation(fig, animate, frames=len(frames), interval=1000/fps)
-        plt.close()
-        return anim.to_jshtml()
-
-    def eval(self, episodes):
-        rewards = []
-        for _ in range(episodes):
-            observation, _ = self.env.reset()
-            episode_reward = 0
-            episode_over = False
-            while not episode_over:
-
-                with torch.no_grad():
-                    q_vals = self.q_net(torch.from_numpy(np.array(observation)).unsqueeze(0).float())
-                    action = torch.argmax(q_vals, dim=1).item()
-
-                observation, reward, terminated, truncated, _ = self.env.step(action)
-                episode_reward += reward
-
-                episode_over = terminated or truncated
-
-            rewards.append(episode_reward)
-
-        print(f"Average Return over {episodes} episodes: {sum(rewards) / episodes}")
-
-        self.env.close()
-
+        print(f"Model loaded from {path}")
+        return ddqn
+    
 # Q-Learning with Temporal Difference (TD)
-class QLearn():
+class QLearn(Agent):
     def __init__(self, env, alpha, gamma, epsilon, epsilon_decay, min_epsilon):
-        self.env = env
+        super().__init__(env)
         self.alpha = alpha # learning rate
         self.gamma = gamma # discount rate
         self.epsilon = epsilon # exploration rate
@@ -188,6 +294,14 @@ class QLearn():
         self.min_epsilon = min_epsilon # minimum exploration rate
 
         self.q_table = defaultdict(lambda: np.zeros(env.action_space.n))
+    
+    def select_action(self, observation):
+        return np.argmax(self.q_table[observation])
+
+    def epsilon_greedy_policy(self, observation):
+        if random.uniform(0, 1) <= self.epsilon:
+            return self.env.action_space.sample()
+        return np.argmax(self.q_table[observation])
 
     def train(self, episodes, stats_interval):
         rewards = []
@@ -201,10 +315,7 @@ class QLearn():
             episode_over = False
             while not episode_over:
 
-                if random.uniform(0, 1) <= self.epsilon:
-                    action = self.env.action_space.sample()
-                else:
-                    action = np.argmax(self.q_table[observation])
+                action = self.epsilon_greedy_policy(observation)
 
                 next_observation, reward, terminated, truncated, _ = self.env.step(action)
 
@@ -235,83 +346,59 @@ class QLearn():
                 print(f"Episodes {(e - stats_interval + 1, e)}:", end=" ")
                 print(f"Avg Reward- {np.mean(rewards[-stats_interval:])}", end=" ")
                 print(f"Epsilon- {self.epsilon}")
+            
+            self.episodes_trained += 1
                 
         self.env.close()
 
         return rewards
 
-    def playback(self, fps=30):
-        episode_reward = []
-        frames = []
+    def save(self, path):
+        checkpoint = {
+            'env': self.env,
+            'q_table': self.q_table,
+            'alpha': self.alpha,
+            'gamma': self.gamma,
+            'epsilon': self.epsilon,
+            'epsilon_decay': self.epsilon_decay,
+            'min_epsilon': self.min_epsilon,
+            'episodes_trained': self.episodes_trained
+        }
+        torch.save(checkpoint, path)
+        print(f"Model saved to {path}")
+    
+    def load(path):
+        checkpoint = torch.load(path)
+        qlearn = QLearn(
+            env=checkpoint['env'],
+            alpha=checkpoint['alpha'],
+            gamma=checkpoint['gamma'],
+            epsilon=checkpoint['epsilon'],
+            epsilon_decay=checkpoint['epsilon_decay'],
+            min_epsilon=checkpoint['min_epsilon']
+        )
+        qlearn.q_table = checkpoint['q_table']
+        qlearn.episodes_trained = checkpoint['episodes_trained']
 
-        observation, _ = self.env.reset()
-        episode_over = False
-        while not episode_over:
-            frames.append(self.env.render())
+        print(f"Model loaded from {path}")
+        return qlearn
 
-            action = np.argmax(self.q_table[observation])
-
-            observation, reward, terminated, truncated, _ = self.env.step(action)
-
-            episode_reward.append(reward)
-
-            episode_over = terminated or truncated
-
-        print(f"Playback Return: {episode_reward[-1] if terminated else sum(episode_reward)}")
-
-        self.env.close()
-
-        fig, ax = plt.subplots()
-        ax.axis("off")
-        im = ax.imshow(frames[0])
-
-        reward_text = ax.text(10, 20, "", color="black", fontsize=12, weight='bold')
-
-        def animate(i):
-            im.set_array(frames[i])
-            r = sum(episode_reward[:i+1])
-            if terminated and i == len(frames) - 1:
-                r = episode_reward[-1]
-            reward_text.set_text(f"Return: {r:.2f}")
-            return [im, reward_text]
-        
-        anim = animation.FuncAnimation(fig, animate, frames=len(frames), interval=1000/fps)
-        plt.close()
-        return anim.to_jshtml()
-
-    def eval(self, episodes):
-        rewards = []
-        for _ in range(episodes):
-            observation, _ = self.env.reset()
-            episode_reward = 0
-            episode_over = False
-            while not episode_over:
-
-                action = np.argmax(self.q_table[observation])
-
-                observation, reward, terminated, truncated, _ = self.env.step(action)
-                last_reward = reward
-                episode_reward += reward
-
-                episode_over = terminated or truncated
-
-            if terminated:
-                episode_reward = last_reward
-
-            rewards.append(episode_reward)
-
-        print(f"Average Return over {episodes} episodes: {sum(rewards) / episodes}")
-
-        self.env.close()
-
-
-# REINFORCE for discrete action space
-class Reinforce():
+# REINFORCE (policy-gradient) for discrete action space with Monte Carlo Sampling
+class Reinforce(Agent):
     def __init__(self, env, policy, optimizer, discount):
-        self.env = env
+        super().__init__(env)
+
         self.policy = policy
         self.optimizer = optimizer
         self.discount = discount
+
+    def sample_action(self, observation):
+        probs = self.policy(torch.from_numpy(np.array(observation)).unsqueeze(0).float())
+        return probs, torch.multinomial(probs, num_samples=1).item()
+    
+    def select_action(self, observation):
+        probs = self.policy(torch.from_numpy(np.array(observation)).unsqueeze(0).float())
+        return torch.argmax(probs, dim=1).item()
     
     def train(self, episodes, stats_interval):
         losses = []
@@ -328,11 +415,7 @@ class Reinforce():
             episode_over = False
             while not episode_over:
 
-                state = torch.tensor(observation).float().view(1, -1)
-
-                # action = env.action_space.sample()  # agent policy that uses the observation and info
-                probs = self.policy(state)
-                action = torch.multinomial(probs, num_samples=1).item()
+                probs, action = self.sample_action(observation)
                 observation, reward, terminated, truncated, _ = self.env.step(action)
 
                 log_probs.append(torch.log(probs[0, action]))
@@ -357,10 +440,10 @@ class Reinforce():
                 returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
             loss = 0
-            self.optimizer.zero_grad()
             for log_prob, R in zip(log_probs, returns):
                 loss += -log_prob * R
-                
+            
+            self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
             self.optimizer.step()
@@ -374,68 +457,32 @@ class Reinforce():
                 
         self.env.close()
 
+        self.episodes_trained += episodes
+
         return rewards, losses
     
-    def playback(self, fps=30, text_color="black"):
-        episode_reward = []
-        frames = []
-
-        observation, _ = self.env.reset()
-        episode_over = False
-        while not episode_over:
-            frames.append(self.env.render())
-
-            with torch.no_grad():
-                probs = self.policy(torch.tensor(observation).float().view(1, -1))
-                action = torch.argmax(probs, dim=1).item()
-
-            observation, reward, terminated, truncated, _ = self.env.step(action)
-            episode_reward.append(reward)
-
-            episode_over = terminated or truncated
-
-        print(f"Playback Return: {sum(episode_reward)}")
-
-        self.env.close()
-
-        fig, ax = plt.subplots()
-        ax.axis("off")
-        im = ax.imshow(frames[0])
-
-        reward_text = ax.text(10, 20, "", color=text_color, fontsize=12, weight='bold')
-
-        def animate(i):
-            im.set_array(frames[i])
-            r = sum(episode_reward[:i+1])
-            reward_text.set_text(f"Return: {r:.2f}")
-            return [im, reward_text]
-        
-        anim = animation.FuncAnimation(fig, animate, frames=len(frames), interval=1000/fps)
-        plt.close()
-        return anim.to_jshtml()
-
-    def eval(self, episodes):
-        rewards = []
-        for _ in range(episodes):
-            observation, _ = self.env.reset()
-            episode_reward = 0
-            episode_over = False
-            while not episode_over:
-
-                with torch.no_grad():
-                    probs = self.policy(torch.tensor(observation).float().view(1, -1))
-                    action = torch.argmax(probs, dim=1).item()
-
-                observation, reward, terminated, truncated, _ = self.env.step(action)
-                episode_reward += reward
-
-                episode_over = terminated or truncated
-
-            rewards.append(episode_reward)
-
-        print(f"Average Return over {episodes} episodes: {sum(rewards) / episodes}")
-
-        self.env.close()
-    
     def save(self, path):
-        torch.save(self.policy.state_dict(), path)
+        checkpoint = {
+            'env': self.env,
+            'policy_state_dict': self.policy.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'discount': self.discount,
+            'episodes_trained': self.episodes_trained
+        }
+        torch.save(checkpoint, path)
+        print(f"Model saved to {path}")
+    
+    def load(path):
+        checkpoint = torch.load(path)
+        reinforce = Reinforce(
+            env=checkpoint['env'],
+            policy=checkpoint['policy_state_dict'].__class__(),
+            optimizer=torch.optim.Adam(checkpoint['policy_state_dict'].__class__().parameters()),
+            discount=checkpoint['discount']
+        )
+        reinforce.policy.load_state_dict(checkpoint['policy_state_dict'])
+        reinforce.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        reinforce.episodes_trained = checkpoint['episodes_trained']
+
+        print(f"Model loaded from {path}")
+        return reinforce
