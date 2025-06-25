@@ -124,6 +124,17 @@ class Agent(ABC):
         Load agent from a file.
         """
         pass
+
+# class A2C(Agent):
+#     def __init__(self, env, actor_critic, gamma):
+#         super().__init__(env)
+
+#         self.actor_critic = actor_critic
+#         self.gamma = gamma
+    
+#     def select_action(self, observation):
+        
+        
     
 # DDQN (Double DQN) with Temporal Difference (TD)
 class DDQN(Agent):
