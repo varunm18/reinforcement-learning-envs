@@ -125,15 +125,17 @@ class Agent(ABC):
         """
         pass
 
-# Advantage Actor Critic (A2C)
+# Advantage Actor Critic (A2C) with Monte Carlo sampling
 class A2C(Agent):
-    def __init__(self, env, actor_critic, optimizer, gamma):
+    def __init__(self, env, actor_critic, optimizer, gamma, critic_coef, entropy_coef):
         super().__init__(env)
 
         self.actor_critic = actor_critic
         self.optimizer = optimizer
         self.gamma = gamma
+        self.critic_coef = critic_coef
         self.critic_loss_fn = nn.MSELoss()
+        self.entropy_coef = entropy_coef
     
     def select_action(self, observation):
         obs_tensor = torch.from_numpy(np.array(observation)).unsqueeze(0).float()
@@ -143,7 +145,12 @@ class A2C(Agent):
     def sample_action(self, observation):
         obs_tensor = torch.from_numpy(np.array(observation)).unsqueeze(0).float()
         probs, value = self.actor_critic(obs_tensor)
-        return probs, torch.multinomial(probs, num_samples=1).item(), value.squeeze()
+
+        action = torch.multinomial(probs, num_samples=1).item()
+        log_prob = torch.log(probs[0, action] + 1e-10)
+        entropy = -(probs * torch.log(probs + 1e-10)).sum()
+
+        return log_prob, action, value.squeeze(), entropy
     
     def train(self, episodes, stats_interval):
         losses = []
@@ -155,17 +162,19 @@ class A2C(Agent):
 
             log_probs = []
             values = []
+            entropies = []
             episode_rewards = []
             total_episode_reward = 0
 
             episode_over = False
             while not episode_over:
 
-                probs, action, value = self.sample_action(observation)
+                log_prob, action, value, entropy = self.sample_action(observation)
                 observation, reward, terminated, truncated, _ = self.env.step(action)
 
-                log_probs.append(torch.log(probs[0, action]))
+                log_probs.append(log_prob)
                 values.append(value)
+                entropies.append(entropy)
 
                 episode_rewards.append(reward)
                 total_episode_reward += reward
@@ -189,16 +198,21 @@ class A2C(Agent):
             
             values = torch.stack(values)
             log_probs = torch.stack(log_probs)
+            entropies = torch.stack(entropies)
             
             advantages = returns - values
+            if advantages.size(dim=-1) > 1:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             actor_loss = -(log_probs * advantages.detach()).sum()
             critic_loss = self.critic_loss_fn(values, returns)
+            entropy_bonus = entropies.mean()
 
-            loss = actor_loss + critic_loss
+            loss = actor_loss + self.critic_coef * critic_loss - self.entropy_coef * entropy_bonus
             
             self.optimizer.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), max_norm=0.5)
             self.optimizer.step()
 
             losses.append(loss.item())
