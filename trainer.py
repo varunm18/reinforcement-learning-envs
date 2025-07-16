@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib import animation
 
 from collections import defaultdict, deque
+from gymnasium.wrappers import RecordVideo
 
 from abc import ABC, abstractmethod
 
@@ -62,10 +63,12 @@ class Agent(ABC):
         """
         pass
     
-    def playback(self, fps=30, text_color="black", show_last_reward=False):
+    def playback(self, fps=30, text_color="black", show_last_reward=False, record_info=None):
         """
         Play back the agent's performance in the environment.
         """
+        if record_info:
+            self.env = gym.wrappers.RecordVideo(self.env, video_folder=record_info[0], name_prefix=record_info[1])
         episode_reward, terminated, truncated, frames = self.play_episode(track_frames=True)
         print(f"Playback Return: {episode_reward[-1] if show_last_reward and terminated else sum(episode_reward)}")
 
@@ -125,115 +128,86 @@ class Agent(ABC):
         """
         pass
 
-# Advantage Actor Critic (A2C) with Monte Carlo sampling
-class A2C(Agent):
-    def __init__(self, env, actor_critic, optimizer, gamma, critic_coef, entropy_coef):
-        super().__init__(env)
 
-        self.actor_critic = actor_critic
-        self.optimizer = optimizer
-        self.gamma = gamma
-        self.critic_coef = critic_coef
-        self.critic_loss_fn = nn.MSELoss()
-        self.entropy_coef = entropy_coef
+# Q-Learning with Temporal Difference (TD)
+class QLearn(Agent):
+    def __init__(self, env, alpha, gamma, epsilon, epsilon_decay, min_epsilon):
+        super().__init__(env)
+        self.alpha = alpha # learning rate
+        self.gamma = gamma # discount rate
+        self.epsilon = epsilon # exploration rate
+        self.epsilon_decay = epsilon_decay # exploration decay rate
+        self.min_epsilon = min_epsilon # minimum exploration rate
+
+        self.q_table = defaultdict(lambda: np.zeros(env.action_space.n))
     
     def select_action(self, observation):
-        obs_tensor = torch.from_numpy(np.array(observation)).unsqueeze(0).float()
-        probs, _ = self.actor_critic(obs_tensor)
-        return torch.argmax(probs, dim=1).item()
-    
-    def sample_action(self, observation):
-        obs_tensor = torch.from_numpy(np.array(observation)).unsqueeze(0).float()
-        probs, value = self.actor_critic(obs_tensor)
+        return np.argmax(self.q_table[observation])
 
-        action = torch.multinomial(probs, num_samples=1).item()
-        log_prob = torch.log(probs[0, action] + 1e-10)
-        entropy = -(probs * torch.log(probs + 1e-10)).sum()
+    def epsilon_greedy_policy(self, observation):
+        if random.uniform(0, 1) <= self.epsilon:
+            return self.env.action_space.sample()
+        return np.argmax(self.q_table[observation])
 
-        return log_prob, action, value.squeeze(), entropy
-    
     def train(self, episodes, stats_interval):
-        losses = []
         rewards = []
         max_reward = 0
 
         for e in range(episodes):
             observation, _ = self.env.reset()
 
-            log_probs = []
-            values = []
-            entropies = []
-            episode_rewards = []
-            total_episode_reward = 0
+            episode_reward = 0
 
             episode_over = False
             while not episode_over:
 
-                log_prob, action, value, entropy = self.sample_action(observation)
-                observation, reward, terminated, truncated, _ = self.env.step(action)
+                action = self.epsilon_greedy_policy(observation)
 
-                log_probs.append(log_prob)
-                values.append(value)
-                entropies.append(entropy)
+                next_observation, reward, terminated, truncated, _ = self.env.step(action)
 
-                episode_rewards.append(reward)
-                total_episode_reward += reward
+                last_reward = reward
+                episode_reward += reward
+
+                old_value = self.q_table[observation][action]
+                next_max = np.max(self.q_table[next_observation])
+
+                self.q_table[observation][action] = ((1 - self.alpha) * old_value) + (self.alpha * (reward + self.gamma * next_max))
+
+                observation = next_observation
 
                 episode_over = terminated or truncated
             
-            rewards.append(total_episode_reward)
-            if total_episode_reward > max_reward:
-                max_reward = total_episode_reward
+            self.epsilon = max(self.epsilon * self.epsilon_decay, self.min_epsilon)
+            
+            if terminated:
+                episode_reward = last_reward
+            
+            rewards.append(episode_reward)
+
+            if episode_reward > max_reward:
+                max_reward = episode_reward
                 print(f"New max of {max_reward} in episode {e + 1}")
-
-            returns = []
-            R = 0
-            for r in reversed(episode_rewards):
-                R = r + self.gamma * R
-                returns.insert(0, R)
-
-            returns = torch.tensor(returns).float()
-            if returns.size(dim=-1) > 1:
-                returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-            
-            values = torch.stack(values)
-            log_probs = torch.stack(log_probs)
-            entropies = torch.stack(entropies)
-            
-            advantages = returns - values
-            if advantages.size(dim=-1) > 1:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-            actor_loss = -(log_probs * advantages.detach()).sum()
-            critic_loss = self.critic_loss_fn(values, returns)
-            entropy_bonus = entropies.mean()
-
-            loss = actor_loss + self.critic_coef * critic_loss - self.entropy_coef * entropy_bonus
-            
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), max_norm=0.5)
-            self.optimizer.step()
-
-            losses.append(loss.item())
 
             if (e + 1) % stats_interval == 0:
                 print(f"Episodes {(e - stats_interval + 1, e)}:", end=" ")
-                print(f"Avg Loss- {sum(losses[e-stats_interval+1:e+1])/stats_interval}", end=" ")
-                print(f"Avg Reward- {sum(rewards[e-stats_interval+1:e+1])/stats_interval}")
+                print(f"Avg Reward- {np.mean(rewards[-stats_interval:])}", end=" ")
+                print(f"Epsilon- {self.epsilon}")
+            
+            self.episodes_trained += 1
                 
         self.env.close()
 
-        self.episodes_trained += episodes
+        return rewards
 
-        return rewards, losses
-    
     def save(self, path):
         checkpoint = {
             'env': self.env,
-            'actor_critic_state_dict': self.actor_critic.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'q_table': self.q_table,
+            'alpha': self.alpha,
             'gamma': self.gamma,
+            'epsilon': self.epsilon,
+            'epsilon_decay': self.epsilon_decay,
+            'min_epsilon': self.min_epsilon,
             'episodes_trained': self.episodes_trained
         }
         torch.save(checkpoint, path)
@@ -241,21 +215,22 @@ class A2C(Agent):
     
     def load(path):
         checkpoint = torch.load(path)
-        a2c = A2C(
+        qlearn = QLearn(
             env=checkpoint['env'],
-            actor_critic=checkpoint['actor_critic_state_dict'].__class__(),
-            optimizer=torch.optim.Adam(checkpoint['actor_critic_state_dict'].__class__().parameters()),
-            gamma=checkpoint['gamma']
+            alpha=checkpoint['alpha'],
+            gamma=checkpoint['gamma'],
+            epsilon=checkpoint['epsilon'],
+            epsilon_decay=checkpoint['epsilon_decay'],
+            min_epsilon=checkpoint['min_epsilon']
         )
-        a2c.actor_critic.load_state_dict(checkpoint['actor_critic_state_dict'])
-        a2c.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        a2c.episodes_trained = checkpoint['episodes_trained']
+        qlearn.q_table = checkpoint['q_table']
+        qlearn.episodes_trained = checkpoint['episodes_trained']
 
         print(f"Model loaded from {path}")
-        return a2c
+        return qlearn
 
     
-# DDQN (Double DQN) with Temporal Difference (TD)
+# DDQN (Double DQN) with Temporal Difference (TD) and replay buffer
 class DDQN(Agent):
     def __init__(self, env, q_net_class, buffer_size, batch_size,
                  gamma, lr, epsilon_start, epsilon_end, 
@@ -412,108 +387,9 @@ class DDQN(Agent):
 
         print(f"Model loaded from {path}")
         return ddqn
-    
-# Q-Learning with Temporal Difference (TD)
-class QLearn(Agent):
-    def __init__(self, env, alpha, gamma, epsilon, epsilon_decay, min_epsilon):
-        super().__init__(env)
-        self.alpha = alpha # learning rate
-        self.gamma = gamma # discount rate
-        self.epsilon = epsilon # exploration rate
-        self.epsilon_decay = epsilon_decay # exploration decay rate
-        self.min_epsilon = min_epsilon # minimum exploration rate
 
-        self.q_table = defaultdict(lambda: np.zeros(env.action_space.n))
-    
-    def select_action(self, observation):
-        return np.argmax(self.q_table[observation])
 
-    def epsilon_greedy_policy(self, observation):
-        if random.uniform(0, 1) <= self.epsilon:
-            return self.env.action_space.sample()
-        return np.argmax(self.q_table[observation])
-
-    def train(self, episodes, stats_interval):
-        rewards = []
-        max_reward = 0
-
-        for e in range(episodes):
-            observation, _ = self.env.reset()
-
-            episode_reward = 0
-
-            episode_over = False
-            while not episode_over:
-
-                action = self.epsilon_greedy_policy(observation)
-
-                next_observation, reward, terminated, truncated, _ = self.env.step(action)
-
-                last_reward = reward
-                episode_reward += reward
-
-                old_value = self.q_table[observation][action]
-                next_max = np.max(self.q_table[next_observation])
-
-                self.q_table[observation][action] = ((1 - self.alpha) * old_value) + (self.alpha * (reward + self.gamma * next_max))
-
-                observation = next_observation
-
-                episode_over = terminated or truncated
-            
-            self.epsilon = max(self.epsilon * self.epsilon_decay, self.min_epsilon)
-            
-            if terminated:
-                episode_reward = last_reward
-            
-            rewards.append(episode_reward)
-
-            if episode_reward > max_reward:
-                max_reward = episode_reward
-                print(f"New max of {max_reward} in episode {e + 1}")
-
-            if (e + 1) % stats_interval == 0:
-                print(f"Episodes {(e - stats_interval + 1, e)}:", end=" ")
-                print(f"Avg Reward- {np.mean(rewards[-stats_interval:])}", end=" ")
-                print(f"Epsilon- {self.epsilon}")
-            
-            self.episodes_trained += 1
-                
-        self.env.close()
-
-        return rewards
-
-    def save(self, path):
-        checkpoint = {
-            'env': self.env,
-            'q_table': self.q_table,
-            'alpha': self.alpha,
-            'gamma': self.gamma,
-            'epsilon': self.epsilon,
-            'epsilon_decay': self.epsilon_decay,
-            'min_epsilon': self.min_epsilon,
-            'episodes_trained': self.episodes_trained
-        }
-        torch.save(checkpoint, path)
-        print(f"Model saved to {path}")
-    
-    def load(path):
-        checkpoint = torch.load(path)
-        qlearn = QLearn(
-            env=checkpoint['env'],
-            alpha=checkpoint['alpha'],
-            gamma=checkpoint['gamma'],
-            epsilon=checkpoint['epsilon'],
-            epsilon_decay=checkpoint['epsilon_decay'],
-            min_epsilon=checkpoint['min_epsilon']
-        )
-        qlearn.q_table = checkpoint['q_table']
-        qlearn.episodes_trained = checkpoint['episodes_trained']
-
-        print(f"Model loaded from {path}")
-        return qlearn
-
-# REINFORCE (policy-gradient) for discrete action space with Monte Carlo Sampling
+# REINFORCE (policy-gradient) for discrete action space with Monte Carlo sampling
 class Reinforce(Agent):
     def __init__(self, env, policy, optimizer, discount):
         super().__init__(env)
@@ -616,3 +492,152 @@ class Reinforce(Agent):
 
         print(f"Model loaded from {path}")
         return reinforce
+
+
+# Advantage Actor Critic (A2C) with Monte Carlo sampling
+class A2C(Agent):
+    def __init__(self, env, actor_critic, optimizer, gamma, critic_coef, entropy_coef):
+        super().__init__(env)
+
+        self.actor_critic = actor_critic
+        self.optimizer = optimizer
+        self.gamma = gamma
+        self.critic_coef = critic_coef
+        self.critic_loss_fn = nn.MSELoss()
+        self.entropy_coef = entropy_coef
+    
+    def select_action(self, observation):
+        obs_tensor = torch.from_numpy(np.array(observation)).unsqueeze(0).float()
+        probs, _ = self.actor_critic(obs_tensor)
+        return torch.argmax(probs, dim=1).item()
+    
+    def sample_action(self, observation):
+        obs_tensor = torch.from_numpy(np.array(observation)).unsqueeze(0).float()
+        probs, value = self.actor_critic(obs_tensor)
+
+        action = torch.multinomial(probs, num_samples=1).item()
+        log_prob = torch.log(probs[0, action] + 1e-10)
+        entropy = -(probs * torch.log(probs + 1e-10)).sum()
+
+        return log_prob, action, value.squeeze(), entropy
+    
+    def train(self, episodes, stats_interval):
+        losses = []
+        rewards = []
+        max_reward = 0
+
+        for e in range(episodes):
+            observation, _ = self.env.reset()
+
+            log_probs = []
+            values = []
+            entropies = []
+            episode_rewards = []
+            total_episode_reward = 0
+
+            episode_over = False
+            while not episode_over:
+
+                log_prob, action, value, entropy = self.sample_action(observation)
+                observation, reward, terminated, truncated, _ = self.env.step(action)
+
+                log_probs.append(log_prob)
+                values.append(value)
+                entropies.append(entropy)
+
+                episode_rewards.append(reward)
+                total_episode_reward += reward
+
+                episode_over = terminated or truncated
+            
+            rewards.append(total_episode_reward)
+            if total_episode_reward > max_reward:
+                max_reward = total_episode_reward
+                print(f"New max of {max_reward} in episode {e + 1}")
+
+            returns = []
+            R = 0
+            for r in reversed(episode_rewards):
+                R = r + self.gamma * R
+                returns.insert(0, R)
+
+            returns = torch.tensor(returns).float()
+            if returns.size(dim=-1) > 1:
+                returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+            
+            values = torch.stack(values)
+            log_probs = torch.stack(log_probs)
+            entropies = torch.stack(entropies)
+            
+            advantages = returns - values
+            if advantages.size(dim=-1) > 1:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            actor_loss = -(log_probs * advantages.detach()).sum()
+            critic_loss = self.critic_loss_fn(values, returns)
+            entropy_bonus = entropies.mean()
+
+            loss = actor_loss + self.critic_coef * critic_loss - self.entropy_coef * entropy_bonus
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), max_norm=0.5)
+            self.optimizer.step()
+
+            losses.append(loss.item())
+
+            if (e + 1) % stats_interval == 0:
+                print(f"Episodes {(e - stats_interval + 1, e)}:", end=" ")
+                print(f"Avg Loss- {sum(losses[e-stats_interval+1:e+1])/stats_interval}", end=" ")
+                print(f"Avg Reward- {sum(rewards[e-stats_interval+1:e+1])/stats_interval}")
+                
+        self.env.close()
+
+        self.episodes_trained += episodes
+
+        return rewards, losses
+    
+    def save(self, path):
+        checkpoint = {
+            'env': self.env,
+            'actor_critic_state_dict': self.actor_critic.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'gamma': self.gamma,
+            'episodes_trained': self.episodes_trained
+        }
+        torch.save(checkpoint, path)
+        print(f"Model saved to {path}")
+    
+    def load(path):
+        checkpoint = torch.load(path)
+        a2c = A2C(
+            env=checkpoint['env'],
+            actor_critic=checkpoint['actor_critic_state_dict'].__class__(),
+            optimizer=torch.optim.Adam(checkpoint['actor_critic_state_dict'].__class__().parameters()),
+            gamma=checkpoint['gamma']
+        )
+        a2c.actor_critic.load_state_dict(checkpoint['actor_critic_state_dict'])
+        a2c.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        a2c.episodes_trained = checkpoint['episodes_trained']
+
+        print(f"Model loaded from {path}")
+        return a2c
+
+
+# Proximal Policy Optimization (PPO) with Monte Carlo sampling
+class PPO(A2C):
+    def __init__(self, env, actor_critic, optimizer, gamma, critic_coef, entropy_coef, clip_epsilon):
+        super().__init__(env, actor_critic, optimizer, gamma, critic_coef, entropy_coef)
+
+        self.clip_epsilon = clip_epsilon
+    
+    def train(self, episodes, stats_interval):
+        for e in range(episodes):
+            pass
+            
+
+    def save(self, path):
+        pass
+
+    def load(path):
+        pass
