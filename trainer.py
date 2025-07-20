@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib import animation
 
 from collections import defaultdict, deque
-from gymnasium.wrappers import RecordVideo
+import torch.optim.lr_scheduler as lr_scheduler
 
 from abc import ABC, abstractmethod
 
@@ -73,6 +73,7 @@ class Agent(ABC):
         print(f"Playback Return: {episode_reward[-1] if show_last_reward and terminated else sum(episode_reward)}")
 
         self.env.close()
+        self.env = self.env.unwrapped
 
         fig, ax = plt.subplots()
         ax.axis("off")
@@ -626,15 +627,117 @@ class A2C(Agent):
 
 # Proximal Policy Optimization (PPO) with Monte Carlo sampling
 class PPO(A2C):
-    def __init__(self, env, actor_critic, optimizer, gamma, critic_coef, entropy_coef, clip_epsilon):
+    def __init__(self, env, actor_critic, optimizer, gamma, critic_coef, entropy_coef, clip_epsilon, ppo_epochs):
         super().__init__(env, actor_critic, optimizer, gamma, critic_coef, entropy_coef)
 
         self.clip_epsilon = clip_epsilon
+        self.ppo_epochs = ppo_epochs
     
-    def train(self, episodes, stats_interval):
+    def sample_action(self, observation):
+        obs_tensor = torch.from_numpy(np.array(observation)).unsqueeze(0).float()
+        probs, value = self.actor_critic(obs_tensor)
+
+        action = torch.multinomial(probs, num_samples=1).item()
+        log_prob = torch.log(probs[0, action] + 1e-10)
+
+        return log_prob, action, value.squeeze()
+    
+    def train(self, episodes, end_lr, stats_interval):
+        rewards = []
+        losses = []
+        max_reward = 0
+
+        start_lr = self.optimizer.param_groups[0]['lr']
+        lr_decay = lr_scheduler.ExponentialLR(self.optimizer, gamma=pow(end_lr / start_lr, 1 / episodes))
+        # lr_decay = lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1 - epoch / episodes)
+        # initial_lr = self.optimizer.param_groups[0]['lr']
+
         for e in range(episodes):
-            pass
+            observation, _ = self.env.reset()
+
+            observations = []
+            actions = []
+            log_probs = []
+            values = []
+            episode_rewards = []
+            total_episode_reward = 0
+
+            episode_over = False
+            while not episode_over:
+                log_prob, action, value = self.sample_action(observation)
+
+                observations.append(torch.from_numpy(np.array(observation)).float())
+                actions.append(action)
+                log_probs.append(log_prob)
+                values.append(value)
+
+                observation, reward, terminated, truncated, _ = self.env.step(action)
+
+                episode_rewards.append(reward)
+                total_episode_reward += reward
+
+                episode_over = terminated or truncated
             
+            rewards.append(total_episode_reward)
+            if total_episode_reward > max_reward:
+                max_reward = total_episode_reward
+                print(f"New max of {max_reward} in episode {e + 1}")
+
+            returns = []
+            R = 0
+            for r in reversed(episode_rewards):
+                R = r + self.gamma * R
+                returns.insert(0, R)
+
+            returns = torch.tensor(returns).float()
+            if returns.size(dim=-1) > 1:
+                returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+
+            values = torch.stack(values)
+            old_log_probs = torch.stack(log_probs)
+            observations = torch.stack(observations)
+            actions = torch.tensor(actions)
+
+            advantages = returns - values
+            if advantages.size(dim=-1) > 1:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            ppo_loss = []
+            for _ in range(self.ppo_epochs):
+                probs, values = self.actor_critic(observations)
+
+                # New log probs
+                new_log_probs = torch.log(probs[range(len(actions)), actions] + 1e-10)
+                ratio = torch.exp(new_log_probs - old_log_probs.detach())
+
+                surr1 = ratio * advantages.detach()
+                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages.detach()
+                actor_loss = -torch.min(surr1, surr2).mean()
+
+                critic_loss = self.critic_loss_fn(values.squeeze(), returns)
+                entropy_bonus = -(probs * torch.log(probs + 1e-10)).sum(dim=1).mean()
+
+                loss = actor_loss + self.critic_coef * critic_loss - self.entropy_coef * entropy_bonus
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                ppo_loss.append(loss.item())
+
+            losses.append(sum(ppo_loss) / self.ppo_epochs)
+            lr_decay.step()
+            
+            if (e + 1) % stats_interval == 0:
+                print(f"Episodes {(e - stats_interval + 1, e)}:", end=" ")
+                print(f"Avg Loss- {(sum(losses[-stats_interval:]) / stats_interval):.2f}", end=" ")
+                print(f"Avg Reward- {(sum(rewards[-stats_interval:]) / stats_interval):.2f}", end=" ")
+                print(f"LR- {lr_decay.get_last_lr()[0]:.6f}")
+        
+        self.env.close()
+        self.episodes_trained += episodes
+
+        return rewards, losses
 
     def save(self, path):
         pass

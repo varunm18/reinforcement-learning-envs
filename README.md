@@ -1,8 +1,7 @@
 # TODO
 
-- [ ] Change REINFORCE class to be compatible with CNNs (view to squeeze)
-- [ ] Merge all classes under super class
-- [ ] DDQN for Lunar Lander
+- [x] Change REINFORCE class to be compatible with CNNs (view to squeeze)
+- [x] Merge all classes under super class
 - [ ] Solve Car-racing
 - [ ] Solve Space-invaders
 - [ ] Solve Pong
