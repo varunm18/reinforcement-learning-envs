@@ -73,7 +73,7 @@ class Agent(ABC):
         print(f"Playback Return: {episode_reward[-1] if show_last_reward and terminated else sum(episode_reward)}")
 
         self.env.close()
-        self.env = self.env.unwrapped
+        self.env = self.env.env
 
         fig, ax = plt.subplots()
         ax.axis("off")
@@ -718,6 +718,7 @@ class PPO(A2C):
                 entropy_bonus = -(probs * torch.log(probs + 1e-10)).sum(dim=1).mean()
 
                 loss = actor_loss + self.critic_coef * critic_loss - self.entropy_coef * entropy_bonus
+                print(f"Actor: {actor_loss}, Critic: {self.critic_coef * critic_loss}, Entropy: {-self.entropy_coef * entropy_bonus}")
 
                 self.optimizer.zero_grad()
                 loss.backward()
