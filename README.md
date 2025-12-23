@@ -1,4 +1,7 @@
 # Reinforcement Learning
+Various RL algos written from scratch and used on gymnasium environments
+
+## Results
 
 | Taxi (Q-Learning) | Cart Pole (REINFORCE) | LunarLander (PPO) |
 |------|------|------|
@@ -6,7 +9,7 @@
 
 | Space Invaders (DDQN, to be improved) | Pong (To Do) | Car Racer (To Do) |
 |------|------|------|
-|<img src="https://github.com/user-attachments/assets/70e590e7-c949-491b-a633-6775c844c0b3" width="120%" height="120%"/>|||
+|<img src="https://github.com/user-attachments/assets/70e590e7-c949-491b-a633-6775c844c0b3" width="100%" height="100%"/>|||
 
 
 
